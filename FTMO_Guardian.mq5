@@ -1,15 +1,19 @@
 //+------------------------------------------------------------------+
-//|                                               FTMO_Guardian.mq5  |
-//|                                    Anthony's FTMO Challenge EA   |
-//|                                                                  |
-//|  Strategy: Asian Range Breakout during London/NY sessions        |
-//|  Style:    Relaxed swing/day-swing — few trades per week         |
-//|  Rules:    Full FTMO risk management enforcement                 |
+//|                                          FTMO_Guardian v2.0.mq5  |
+//|                              Anthony's FTMO Challenge Guardian    |
+//|                                                                   |
+//|  Strategy: Asian Range Breakout — H4 Trend-Filtered              |
+//|  Pair:     XAUUSD (Gold) — optimized for high-ATR instruments    |
+//|  Style:    Relaxed semi-swing — 2-4 trades/week, A+ setups only  |
+//|  Edge:     Trend alignment + session volatility + risk mgmt      |
 //+------------------------------------------------------------------+
 #property copyright "Anthony — FTMO Challenge"
-#property link      ""
-#property version   "1.00"
+#property link      "https://github.com/AnthonyBechay/mt5"
+#property version   "2.00"
 #property strict
+#property description "Professional FTMO Guardian with H4 trend filter, "
+#property description "ATR volatility gate, news filter, spread filter, "
+#property description "partial TP, session exit, and manual trade blocker."
 
 #include <Trade\Trade.mqh>
 #include <Trade\PositionInfo.mqh>
@@ -17,53 +21,90 @@
 #include <Trade\SymbolInfo.mqh>
 
 //+------------------------------------------------------------------+
-//| INPUT PARAMETERS — Tweak these, don't touch the logic            |
+//| INPUT PARAMETERS                                                  |
 //+------------------------------------------------------------------+
 
-//--- Account & Risk Management
-input group "=== RISK MANAGEMENT ==="
-input double   InpRiskPercent        = 0.5;     // Risk % per trade
-input double   InpDailyLossCapPct    = 2.0;     // Daily loss cap %
-input double   InpMaxDrawdownPct     = 9.0;     // Max drawdown % (FTMO=10, buffer=9)
-input int      InpMaxTradesPerDay    = 2;        // Max trades per day
-input int      InpMaxOpenPositions   = 1;        // Max simultaneous positions
+//--- Account & Risk
+input group "══════ RISK MANAGEMENT ══════"
+input double   InpRiskPercent        = 0.5;     // Risk % per trade (0.5 = $500 on 100k)
+input double   InpDailyLossCapPct    = 4.0;     // Daily loss cap % (FTMO=5%, buffer=4%)
+input double   InpMaxDrawdownPct     = 9.0;     // Max drawdown % (FTMO=10%, buffer=9%)
+input int      InpMaxTradesPerDay    = 2;       // Max trades per day
+input int      InpMaxOpenPositions   = 1;       // Max simultaneous positions
 
 //--- Strategy: Asian Range Breakout
-input group "=== STRATEGY ==="
+input group "══════ ASIAN RANGE BREAKOUT ══════"
 input int      InpAsianStartHour     = 0;       // Asian range start (server hour)
 input int      InpAsianEndHour       = 7;       // Asian range end (server hour)
-input double   InpMinRangePoints     = 300;     // Min Asian range size (points)
-input double   InpMaxRangePoints     = 2000;    // Max Asian range size (points)
-input double   InpBreakoutBuffer     = 50;      // Breakout buffer above/below range (points)
+input double   InpMinRangePoints     = 300;     // Min Asian range (points)
+input double   InpMaxRangePoints     = 2500;    // Max Asian range (points)
+input double   InpBreakoutBuffer     = 50;      // Breakout buffer (points)
 input double   InpMinRR              = 3.0;     // Minimum reward:risk ratio
-input bool     InpRequireRetest      = false;   // Require price retest of range edge
 
-//--- Session Filters
-input group "=== SESSION FILTERS ==="
+//--- H4 Trend Filter
+input group "══════ TREND FILTER (H4) ══════"
+input bool     InpUseTrendFilter     = true;    // Enable H4 trend filter
+input int      InpTrendEMA_Period    = 50;      // H4 EMA period for trend
+input int      InpTrendEMA_Buffer    = 0;       // Min distance from EMA (points, 0=disabled)
+
+//--- ATR Volatility Gate
+input group "══════ VOLATILITY FILTER ══════"
+input bool     InpUseATRFilter       = true;    // Enable ATR volatility gate
+input int      InpATR_Period         = 14;      // ATR period (H1)
+input double   InpATR_MinMultiplier  = 0.5;     // Min ATR vs 20-day avg (skip if too quiet)
+input double   InpATR_MaxMultiplier  = 2.5;     // Max ATR vs 20-day avg (skip if overextended)
+
+//--- Spread Filter
+input group "══════ SPREAD FILTER ══════"
+input bool     InpUseSpreadFilter    = true;    // Enable spread filter
+input int      InpMaxSpreadPoints    = 40;      // Max spread allowed (points)
+
+//--- News Filter
+input group "══════ NEWS FILTER ══════"
+input bool     InpUseNewsFilter      = true;    // Enable news filter (MT5 calendar)
+input int      InpNewsMinutesBefore  = 30;      // Minutes before news to stop entries
+input int      InpNewsMinutesAfter   = 15;      // Minutes after news to resume
+
+//--- Session Windows
+input group "══════ SESSION FILTERS ══════"
 input int      InpLondonStartHour    = 8;       // London session start (server hour)
-input int      InpLondonEndHour      = 11;      // London session end (server hour)
+input int      InpLondonEndHour      = 11;      // London entry window end
 input int      InpNYStartHour        = 13;      // NY overlap start (server hour)
-input int      InpNYEndHour          = 15;      // NY overlap end (server hour)
+input int      InpNYEndHour          = 16;      // NY session end — all trades closed
 input bool     InpTradeLondon        = true;    // Trade London session
 input bool     InpTradeNY            = true;    // Trade NY session
+input bool     InpCloseEndOfNY       = true;    // Close open trades at NY end (no overnight)
 
-//--- Stop Loss Management
-input group "=== SL MANAGEMENT ==="
-input double   InpBE_TriggerRR       = 1.0;    // Move SL to BE at this R:R
-input double   InpBE_PlusPips        = 2.0;    // BE + this many pips
-input bool     InpTrailAfterBE       = false;  // Trail stop after BE (keep false for hands-off)
+//--- Stop Loss & Take Profit Management
+input group "══════ SL/TP MANAGEMENT ══════"
+input double   InpBE_TriggerRR       = 1.5;    // Move SL to BE at this R:R
+input double   InpBE_PlusPips        = 2.0;    // BE + this many pips lock-in
+input bool     InpUsePartialTP       = true;    // Enable partial take-profit
+input double   InpPartialTP_RR       = 2.0;    // Close partial at this R:R
+input double   InpPartialTP_Pct      = 50.0;   // % of position to close at partial TP
+input double   InpFinalTP_RR         = 4.0;    // Final TP target R:R (remainder)
+input bool     InpTrailAfterPartial  = true;   // Trail stop after partial TP
+input double   InpTrailStepRR        = 0.5;    // Trail step size in R multiples
 
 //--- Kill Switch
-input group "=== KILL SWITCH ==="
-input int      InpMaxConsecLosses    = 3;       // Consecutive losses → stop trading today
-input bool     InpFridayFilter       = true;    // No new trades on Friday afternoon
-input int      InpFridayCutoffHour   = 12;      // Friday cutoff hour (server time)
+input group "══════ KILL SWITCH ══════"
+input int      InpMaxConsecLosses    = 3;       // Consecutive losses → stop for the day
+input bool     InpFridayFilter       = true;    // No new trades Friday afternoon
+input int      InpFridayCutoffHour   = 12;      // Friday cutoff (server hour)
+
+//--- Manual Trade Blocker
+input group "══════ MANUAL TRADE BLOCKER ══════"
+input bool     InpBlockManualTrades  = true;    // Auto-close manual trades outside hours
+input bool     InpBlockManualAlways  = false;   // Block ALL manual trades (full guardian mode)
 
 //--- Display
-input group "=== DISPLAY ==="
+input group "══════ DISPLAY ══════"
 input bool     InpShowDashboard      = true;    // Show on-chart dashboard
-input color    InpDashColor          = clrWhite;
-input color    InpAsianBoxColor      = clrDarkSlateGray;
+input color    InpDashBgColor        = clrBlack;
+input color    InpDashTextColor      = clrWhite;
+input color    InpDashWarnColor      = clrOrangeRed;
+input color    InpDashGoodColor      = clrLime;
+input color    InpAsianBoxColor      = C'30,40,50';
 
 //+------------------------------------------------------------------+
 //| GLOBAL VARIABLES                                                  |
@@ -73,23 +114,33 @@ CPositionInfo  posInfo;
 CAccountInfo   accInfo;
 CSymbolInfo    symInfo;
 
-//--- State tracking
-double   g_startingBalance;        // Balance at start of day
-double   g_challengeStartBalance;  // Balance at start of challenge (set once)
-double   g_asianHigh;              // Today's Asian session high
-double   g_asianLow;               // Today's Asian session low
-bool     g_asianRangeSet;          // Asian range calculated for today
-bool     g_tradedLongToday;        // Already took a long breakout today
-bool     g_tradedShortToday;       // Already took a short breakout today
-int      g_tradesToday;            // Trade count today
-int      g_consecLosses;           // Consecutive losses
-bool     g_killSwitchActive;       // Kill switch engaged
-datetime g_lastBarTime;            // For new bar detection
-int      g_currentDay;             // Track day changes
-bool     g_beMovedForTicket[];     // Track BE moves per position
+//--- State
+double   g_startingBalance;
+double   g_challengeStartBalance;
+double   g_asianHigh;
+double   g_asianLow;
+bool     g_asianRangeSet;
+bool     g_tradedLongToday;
+bool     g_tradedShortToday;
+int      g_tradesToday;
+int      g_consecLosses;
+bool     g_killSwitchActive;
+string   g_killReason;
+datetime g_lastBarTime;
+int      g_currentDay;
 
-//--- Dashboard object names
-string   g_dashPrefix = "FG_";
+//--- Indicator handles
+int      g_hEMA_H4;
+int      g_hATR_H1;
+
+//--- Partial TP tracking (by ticket)
+#define  MAX_TRACKED_TICKETS 20
+ulong    g_partialDone_Tickets[MAX_TRACKED_TICKETS];
+bool     g_partialDone_Flags[MAX_TRACKED_TICKETS];
+int      g_partialCount;
+
+//--- Dashboard
+string   g_dashPrefix = "FGv2_";
 
 //+------------------------------------------------------------------+
 //| Expert initialization                                             |
@@ -99,46 +150,61 @@ int OnInit()
    //--- Validate inputs
    if(InpRiskPercent <= 0 || InpRiskPercent > 2.0)
    {
-      Alert("Risk percent must be between 0.01 and 2.0. You set: ", InpRiskPercent);
+      Alert("Risk must be 0.01–2.0%. You set: ", InpRiskPercent);
       return INIT_PARAMETERS_INCORRECT;
    }
-   
-   if(InpMinRR < 1.0)
+   if(InpMinRR < 1.5)
    {
-      Alert("Minimum R:R must be >= 1.0. You set: ", InpMinRR);
+      Alert("Minimum R:R should be >= 1.5 for FTMO. You set: ", InpMinRR);
       return INIT_PARAMETERS_INCORRECT;
    }
 
-   //--- Initialize
+   //--- Initialize symbol
    symInfo.Name(_Symbol);
-   trade.SetExpertMagicNumber(240325);  // Unique magic number
-   trade.SetDeviationInPoints(30);      // Slippage tolerance
+   trade.SetExpertMagicNumber(240325);
+   trade.SetDeviationInPoints(30);
    trade.SetTypeFilling(ORDER_FILLING_IOC);
-   
-   //--- Set starting balances
-   g_startingBalance = AccountInfoDouble(ACCOUNT_BALANCE);
-   
-   //--- Load challenge start balance from global variable (persists across restarts)
-   if(!GlobalVariableCheck("FTMO_ChallengeStart"))
+
+   //--- Create indicator handles
+   g_hEMA_H4 = iMA(_Symbol, PERIOD_H4, InpTrendEMA_Period, 0, MODE_EMA, PRICE_CLOSE);
+   g_hATR_H1 = iATR(_Symbol, PERIOD_H1, InpATR_Period);
+
+   if(g_hEMA_H4 == INVALID_HANDLE || g_hATR_H1 == INVALID_HANDLE)
    {
-      GlobalVariableSet("FTMO_ChallengeStart", g_startingBalance);
+      Alert("Failed to create indicator handles.");
+      return INIT_FAILED;
+   }
+
+   //--- Balances
+   g_startingBalance = AccountInfoDouble(ACCOUNT_BALANCE);
+
+   if(!GlobalVariableCheck("FTMO_ChallengeStart_v2"))
+   {
+      GlobalVariableSet("FTMO_ChallengeStart_v2", g_startingBalance);
       g_challengeStartBalance = g_startingBalance;
    }
    else
-   {
-      g_challengeStartBalance = GlobalVariableGet("FTMO_ChallengeStart");
-   }
-   
-   //--- Reset daily state
+      g_challengeStartBalance = GlobalVariableGet("FTMO_ChallengeStart_v2");
+
+   //--- Reset state
    ResetDailyState();
-   
-   Print("=== FTMO Guardian EA Initialized ===");
-   Print("Account Balance: ", g_startingBalance);
-   Print("Challenge Start: ", g_challengeStartBalance);
-   Print("Risk per trade: ", InpRiskPercent, "%");
-   Print("Daily loss cap: ", InpDailyLossCapPct, "%");
-   Print("Symbol: ", _Symbol);
-   
+   g_partialCount = 0;
+   ArrayInitialize(g_partialDone_Flags, false);
+
+   Print("═══════════════════════════════════════");
+   Print("  FTMO GUARDIAN v2.0 — INITIALIZED");
+   Print("  Account: $", g_startingBalance);
+   Print("  Challenge Start: $", g_challengeStartBalance);
+   Print("  Risk/trade: ", InpRiskPercent, "% ($", NormalizeDouble(g_startingBalance * InpRiskPercent / 100, 2), ")");
+   Print("  Symbol: ", _Symbol);
+   Print("  Trend filter: ", InpUseTrendFilter ? "ON (H4 EMA " + IntegerToString(InpTrendEMA_Period) + ")" : "OFF");
+   Print("  ATR filter: ", InpUseATRFilter ? "ON" : "OFF");
+   Print("  News filter: ", InpUseNewsFilter ? "ON" : "OFF");
+   Print("  Spread filter: ", InpUseSpreadFilter ? "ON (max " + IntegerToString(InpMaxSpreadPoints) + " pts)" : "OFF");
+   Print("  Partial TP: ", InpUsePartialTP ? "ON (50% at 2R)" : "OFF");
+   Print("  Manual blocker: ", InpBlockManualTrades ? "ON" : "OFF");
+   Print("═══════════════════════════════════════");
+
    return INIT_SUCCEEDED;
 }
 
@@ -147,7 +213,8 @@ int OnInit()
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason)
 {
-   //--- Clean up dashboard objects
+   if(g_hEMA_H4 != INVALID_HANDLE) IndicatorRelease(g_hEMA_H4);
+   if(g_hATR_H1 != INVALID_HANDLE) IndicatorRelease(g_hATR_H1);
    ObjectsDeleteAll(0, g_dashPrefix);
    Comment("");
 }
@@ -157,10 +224,9 @@ void OnDeinit(const int reason)
 //+------------------------------------------------------------------+
 void OnTick()
 {
-   //--- Refresh symbol info
    symInfo.RefreshRates();
-   
-   //--- Check for new day
+
+   //--- Day change detection
    MqlDateTime dt;
    TimeCurrent(dt);
    if(dt.day != g_currentDay)
@@ -168,41 +234,48 @@ void OnTick()
       ResetDailyState();
       g_currentDay = dt.day;
       g_startingBalance = AccountInfoDouble(ACCOUNT_BALANCE);
-      Print("--- New trading day. Starting balance: ", g_startingBalance, " ---");
+      Print("─── New day. Balance: $", g_startingBalance, " ───");
    }
-   
-   //--- ALWAYS run position management (BE moves, etc.) every tick
+
+   //--- ALWAYS: manage open positions (BE, partials, trailing)
    ManageOpenPositions();
-   
-   //--- Run strategy logic only on new H1 bar (performance + no overtrading)
+
+   //--- ALWAYS: check manual trade blocker
+   if(InpBlockManualTrades || InpBlockManualAlways)
+      CheckManualTrades();
+
+   //--- ALWAYS: session exit check
+   if(InpCloseEndOfNY)
+      CheckSessionExit();
+
+   //--- Strategy on new H1 bar only
    datetime currentBarTime = iTime(_Symbol, PERIOD_H1, 0);
-   if(currentBarTime == g_lastBarTime) 
+   if(currentBarTime == g_lastBarTime)
    {
       if(InpShowDashboard) UpdateDashboard();
       return;
    }
    g_lastBarTime = currentBarTime;
-   
-   //--- Build Asian range if not set
+
+   //--- Build Asian range
    if(!g_asianRangeSet)
       CalculateAsianRange();
-   
-   //--- Check all safety gates before looking for entries
+
+   //--- Check all gates
    if(!PassesSafetyChecks())
    {
       if(InpShowDashboard) UpdateDashboard();
       return;
    }
-   
-   //--- Look for breakout entry
+
+   //--- Look for entry
    CheckBreakoutEntry();
-   
-   //--- Update display
+
    if(InpShowDashboard) UpdateDashboard();
 }
 
 //+------------------------------------------------------------------+
-//| RESET daily tracking state                                        |
+//| RESET daily state                                                 |
 //+------------------------------------------------------------------+
 void ResetDailyState()
 {
@@ -213,40 +286,32 @@ void ResetDailyState()
    g_tradedShortToday = false;
    g_tradesToday      = 0;
    g_killSwitchActive = false;
-   // Don't reset g_consecLosses — carries across days until a win
+   g_killReason       = "";
 }
 
 //+------------------------------------------------------------------+
-//| CALCULATE Asian session range                                     |
+//| CALCULATE Asian session high/low                                  |
 //+------------------------------------------------------------------+
 void CalculateAsianRange()
 {
    MqlDateTime dt;
    TimeCurrent(dt);
-   
-   //--- Only calculate after Asian session ends
    if(dt.hour < InpAsianEndHour) return;
-   
-   //--- Get today's date at Asian start
-   datetime asianStart = StringToTime(IntegerToString(dt.year) + "." + 
-                          IntegerToString(dt.mon) + "." + 
-                          IntegerToString(dt.day) + " " + 
-                          IntegerToString(InpAsianStartHour) + ":00");
-   datetime asianEnd   = StringToTime(IntegerToString(dt.year) + "." + 
-                          IntegerToString(dt.mon) + "." + 
-                          IntegerToString(dt.day) + " " + 
-                          IntegerToString(InpAsianEndHour) + ":00");
-   
-   //--- Find high and low of Asian session using M15 bars
+
+   datetime asianStart = StringToTime(StringFormat("%d.%02d.%02d %02d:00",
+                           dt.year, dt.mon, dt.day, InpAsianStartHour));
+   datetime asianEnd   = StringToTime(StringFormat("%d.%02d.%02d %02d:00",
+                           dt.year, dt.mon, dt.day, InpAsianEndHour));
+
    int startBar = iBarShift(_Symbol, PERIOD_M15, asianStart);
    int endBar   = iBarShift(_Symbol, PERIOD_M15, asianEnd);
-   
+
    if(startBar < 0 || endBar < 0 || startBar <= endBar)
    {
-      Print("Warning: Could not calculate Asian range bars. Start:", startBar, " End:", endBar);
+      Print("Warning: Asian range bar shift failed. Start:", startBar, " End:", endBar);
       return;
    }
-   
+
    double high = 0, low = DBL_MAX;
    for(int i = endBar; i <= startBar; i++)
    {
@@ -255,200 +320,312 @@ void CalculateAsianRange()
       if(h > high) high = h;
       if(l < low)  low  = l;
    }
-   
+
    g_asianHigh = high;
    g_asianLow  = low;
-   
-   //--- Validate range size
+
    double rangePoints = (high - low) / _Point;
    if(rangePoints >= InpMinRangePoints && rangePoints <= InpMaxRangePoints)
    {
       g_asianRangeSet = true;
       DrawAsianBox(asianStart, asianEnd, high, low);
-      Print("Asian Range SET — High: ", high, " Low: ", low, " Range: ", rangePoints, " pts");
+      Print("✓ Asian Range: ", NormalizeDouble(low, (int)symInfo.Digits()),
+            " — ", NormalizeDouble(high, (int)symInfo.Digits()),
+            " (", NormalizeDouble(rangePoints, 0), " pts)");
    }
    else
    {
-      Print("Asian Range REJECTED — Size: ", rangePoints, " pts (min:", InpMinRangePoints, " max:", InpMaxRangePoints, ")");
-      g_asianRangeSet = false;
+      Print("✗ Asian Range rejected: ", NormalizeDouble(rangePoints, 0),
+            " pts (need ", InpMinRangePoints, "–", InpMaxRangePoints, ")");
    }
 }
 
 //+------------------------------------------------------------------+
-//| SAFETY CHECKS — All must pass before any entry                    |
+//| SAFETY CHECKS — all gates must pass                               |
 //+------------------------------------------------------------------+
 bool PassesSafetyChecks()
 {
-   //--- Kill switch
-   if(g_killSwitchActive)
-      return false;
-   
-   //--- Max trades per day
-   if(g_tradesToday >= InpMaxTradesPerDay)
-      return false;
-   
-   //--- Max open positions
-   int openPos = CountOpenPositions();
-   if(openPos >= InpMaxOpenPositions)
-      return false;
-   
+   if(g_killSwitchActive) return false;
+   if(g_tradesToday >= InpMaxTradesPerDay) return false;
+   if(CountOpenPositions() >= InpMaxOpenPositions) return false;
+
    //--- Daily loss cap
    double dailyPnL = GetDailyPnL();
-   double dailyLossLimit = g_startingBalance * (InpDailyLossCapPct / 100.0);
-   if(dailyPnL <= -dailyLossLimit)
+   double dailyLimit = g_startingBalance * (InpDailyLossCapPct / 100.0);
+   if(dailyPnL <= -dailyLimit)
    {
-      if(!g_killSwitchActive)
-      {
-         g_killSwitchActive = true;
-         Print("!!! KILL SWITCH: Daily loss cap hit. PnL: ", dailyPnL, " Limit: -", dailyLossLimit);
-         Alert("FTMO Guardian: Daily loss cap reached! Trading stopped for today.");
-      }
+      EngageKillSwitch("Daily loss cap hit: $" + DoubleToString(dailyPnL, 2));
       return false;
    }
-   
-   //--- Max drawdown from challenge start
-   double currentEquity = AccountInfoDouble(ACCOUNT_EQUITY);
-   double drawdownPct = ((g_challengeStartBalance - currentEquity) / g_challengeStartBalance) * 100.0;
-   if(drawdownPct >= InpMaxDrawdownPct)
+
+   //--- Max drawdown
+   double equity = AccountInfoDouble(ACCOUNT_EQUITY);
+   double ddPct = ((g_challengeStartBalance - equity) / g_challengeStartBalance) * 100.0;
+   if(ddPct >= InpMaxDrawdownPct)
    {
-      g_killSwitchActive = true;
-      Print("!!! KILL SWITCH: Max drawdown approaching. DD: ", drawdownPct, "%");
-      Alert("FTMO Guardian: Approaching max drawdown! Trading stopped.");
+      EngageKillSwitch("Max drawdown: " + DoubleToString(ddPct, 2) + "%");
       return false;
    }
-   
-   //--- Consecutive losses kill switch
+
+   //--- Consecutive losses
    if(g_consecLosses >= InpMaxConsecLosses)
    {
-      g_killSwitchActive = true;
-      Print("!!! KILL SWITCH: ", g_consecLosses, " consecutive losses.");
+      EngageKillSwitch(IntegerToString(g_consecLosses) + " consecutive losses");
       return false;
    }
-   
-   //--- Session filter
-   if(!IsInTradingSession())
-      return false;
-   
+
+   //--- Session check
+   if(!IsInEntryWindow()) return false;
+
    //--- Friday filter
    MqlDateTime dt;
    TimeCurrent(dt);
    if(InpFridayFilter && dt.day_of_week == 5 && dt.hour >= InpFridayCutoffHour)
       return false;
-   
-   //--- Monday filter — skip first 2 hours (gaps)
+
+   //--- Monday gap filter
    if(dt.day_of_week == 1 && dt.hour < 2)
       return false;
-   
-   //--- Asian range must be set
-   if(!g_asianRangeSet)
+
+   //--- Asian range must exist
+   if(!g_asianRangeSet) return false;
+
+   //--- Spread filter
+   if(InpUseSpreadFilter)
+   {
+      int spread = (int)symInfo.Spread();
+      if(spread > InpMaxSpreadPoints)
+      {
+         Print("Spread too wide: ", spread, " pts (max: ", InpMaxSpreadPoints, ")");
+         return false;
+      }
+   }
+
+   //--- ATR volatility gate
+   if(InpUseATRFilter && !PassesATRFilter())
       return false;
-   
+
+   //--- News filter
+   if(InpUseNewsFilter && IsNearHighImpactNews())
+      return false;
+
    return true;
 }
 
 //+------------------------------------------------------------------+
-//| CHECK for breakout entry signals                                  |
+//| H4 TREND FILTER — EMA direction check                            |
+//+------------------------------------------------------------------+
+int GetTrendDirection()
+{
+   // Returns: +1 = bullish, -1 = bearish, 0 = neutral/no filter
+   if(!InpUseTrendFilter) return 0;
+
+   double emaValue[];
+   ArraySetAsSeries(emaValue, true);
+   if(CopyBuffer(g_hEMA_H4, 0, 0, 2, emaValue) < 2) return 0;
+
+   double currentPrice = symInfo.Bid();
+   double ema = emaValue[0];
+   double bufferDist = InpTrendEMA_Buffer * _Point;
+
+   if(currentPrice > ema + bufferDist)  return +1;  // Bullish
+   if(currentPrice < ema - bufferDist)  return -1;  // Bearish
+
+   return 0; // Too close to EMA — no clear bias
+}
+
+//+------------------------------------------------------------------+
+//| ATR VOLATILITY GATE                                               |
+//+------------------------------------------------------------------+
+bool PassesATRFilter()
+{
+   double atrCurrent[];
+   ArraySetAsSeries(atrCurrent, true);
+   if(CopyBuffer(g_hATR_H1, 0, 0, 1, atrCurrent) < 1) return true;
+
+   // Get 20-day average ATR for comparison
+   double atrHistory[];
+   ArraySetAsSeries(atrHistory, true);
+   int barsNeeded = 24 * 20; // ~20 days of H1 bars
+   if(CopyBuffer(g_hATR_H1, 0, 0, barsNeeded, atrHistory) < barsNeeded) return true;
+
+   double avgATR = 0;
+   for(int i = 0; i < barsNeeded; i++)
+      avgATR += atrHistory[i];
+   avgATR /= barsNeeded;
+
+   if(avgATR <= 0) return true;
+
+   double ratio = atrCurrent[0] / avgATR;
+
+   if(ratio < InpATR_MinMultiplier)
+   {
+      Print("ATR too low: ratio ", NormalizeDouble(ratio, 2), " (need >", InpATR_MinMultiplier, ")");
+      return false;
+   }
+   if(ratio > InpATR_MaxMultiplier)
+   {
+      Print("ATR too high: ratio ", NormalizeDouble(ratio, 2), " (max ", InpATR_MaxMultiplier, ")");
+      return false;
+   }
+
+   return true;
+}
+
+//+------------------------------------------------------------------+
+//| NEWS FILTER — MT5 Economic Calendar                               |
+//+------------------------------------------------------------------+
+bool IsNearHighImpactNews()
+{
+   datetime now = TimeCurrent();
+   datetime from = now - InpNewsMinutesBefore * 60;
+   datetime to   = now + InpNewsMinutesBefore * 60;
+
+   MqlCalendarValue values[];
+   int count = CalendarValueHistory(values, from, to);
+
+   if(count <= 0) return false;
+
+   for(int i = 0; i < count; i++)
+   {
+      MqlCalendarEvent event;
+      if(!CalendarEventById(values[i].event_id, event)) continue;
+
+      // Only care about high-impact events
+      if(event.importance != CALENDAR_IMPORTANCE_HIGH) continue;
+
+      // Check if event affects our currency
+      MqlCalendarCountry country;
+      if(!CalendarCountryById(event.country_id, country)) continue;
+
+      string curr = country.currency;
+      // For XAUUSD, we care about USD events
+      if(StringFind(_Symbol, curr) < 0 && curr != "USD") continue;
+
+      // We're near a high-impact event
+      datetime eventTime = values[i].time;
+      long secsBefore = (long)(eventTime - now);
+      long secsAfter  = (long)(now - eventTime);
+
+      if(secsBefore >= 0 && secsBefore <= InpNewsMinutesBefore * 60)
+      {
+         Print("⚠ News filter: ", event.name, " in ", secsBefore / 60, " minutes");
+         return true;
+      }
+      if(secsAfter >= 0 && secsAfter <= InpNewsMinutesAfter * 60)
+      {
+         Print("⚠ News filter: ", event.name, " was ", secsAfter / 60, " min ago");
+         return true;
+      }
+   }
+
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| CHECK for breakout entries                                        |
 //+------------------------------------------------------------------+
 void CheckBreakoutEntry()
 {
    double ask = symInfo.Ask();
    double bid = symInfo.Bid();
    double buffer = InpBreakoutBuffer * _Point;
-   
-   //--- LONG: Price breaks above Asian high + buffer
+   int trendDir = GetTrendDirection();
+
+   //--- LONG: price above Asian high + buffer
    if(!g_tradedLongToday && ask > (g_asianHigh + buffer))
    {
-      double sl = g_asianLow - buffer;  // SL below Asian low
-      double riskDist = ask - sl;
-      double tp = ask + (riskDist * InpMinRR);  // TP at minimum R:R
-      
-      //--- Optional: Require retest (price pulled back to range edge on prior bar)
-      if(InpRequireRetest)
+      // Trend filter: skip longs in bearish trend
+      if(trendDir < 0)
       {
-         double prevLow = iLow(_Symbol, PERIOD_H1, 1);
-         if(prevLow > g_asianHigh + buffer) // Never came back to retest
-            return;
+         Print("Long signal rejected — H4 trend is bearish");
+         g_tradedLongToday = true; // Don't keep checking
+         return;
       }
-      
-      ExecuteTrade(ORDER_TYPE_BUY, ask, sl, tp, "Asian Breakout LONG");
+
+      double sl = g_asianLow - buffer;
+      double riskDist = ask - sl;
+
+      // Partial TP system: set initial TP at final target
+      double tp = ask + (riskDist * InpFinalTP_RR);
+      if(!InpUsePartialTP)
+         tp = ask + (riskDist * InpMinRR);
+
+      ExecuteTrade(ORDER_TYPE_BUY, ask, sl, tp, "ARB Long v2");
    }
-   
-   //--- SHORT: Price breaks below Asian low - buffer
+
+   //--- SHORT: price below Asian low - buffer
    if(!g_tradedShortToday && bid < (g_asianLow - buffer))
    {
-      double sl = g_asianHigh + buffer;  // SL above Asian high
-      double riskDist = sl - bid;
-      double tp = bid - (riskDist * InpMinRR);  // TP at minimum R:R
-      
-      if(InpRequireRetest)
+      if(trendDir > 0)
       {
-         double prevHigh = iHigh(_Symbol, PERIOD_H1, 1);
-         if(prevHigh < g_asianLow - buffer)
-            return;
+         Print("Short signal rejected — H4 trend is bullish");
+         g_tradedShortToday = true;
+         return;
       }
-      
-      ExecuteTrade(ORDER_TYPE_SELL, bid, sl, tp, "Asian Breakout SHORT");
+
+      double sl = g_asianHigh + buffer;
+      double riskDist = sl - bid;
+
+      double tp = bid - (riskDist * InpFinalTP_RR);
+      if(!InpUsePartialTP)
+         tp = bid - (riskDist * InpMinRR);
+
+      ExecuteTrade(ORDER_TYPE_SELL, bid, sl, tp, "ARB Short v2");
    }
 }
 
 //+------------------------------------------------------------------+
-//| EXECUTE a trade with proper position sizing                       |
+//| EXECUTE trade with position sizing                                |
 //+------------------------------------------------------------------+
 void ExecuteTrade(ENUM_ORDER_TYPE orderType, double price, double sl, double tp, string comment)
 {
-   //--- Calculate position size based on risk
    double riskAmount = AccountInfoDouble(ACCOUNT_BALANCE) * (InpRiskPercent / 100.0);
    double slDistance = MathAbs(price - sl);
-   
+
    if(slDistance <= 0)
    {
-      Print("Error: SL distance is zero or negative.");
+      Print("Error: SL distance zero.");
       return;
    }
-   
-   //--- Get tick value for proper lot calculation
+
    double tickSize  = symInfo.TickSize();
    double tickValue = symInfo.TickValue();
-   
    if(tickSize == 0 || tickValue == 0)
    {
-      Print("Error: Could not get tick size/value.");
+      Print("Error: tick size/value unavailable.");
       return;
    }
-   
+
    double lotSize = (riskAmount * tickSize) / (slDistance * tickValue);
-   
-   //--- Normalize lot size to broker requirements
+
    double minLot  = symInfo.LotsMin();
    double maxLot  = symInfo.LotsMax();
    double lotStep = symInfo.LotsStep();
-   
+
    lotSize = MathFloor(lotSize / lotStep) * lotStep;
    lotSize = MathMax(minLot, MathMin(maxLot, lotSize));
-   
-   //--- Final safety: Check if this trade's risk exceeds our limit
+
+   // Final risk verification
    double actualRisk = (slDistance / tickSize) * tickValue * lotSize;
-   double maxRiskAllowed = AccountInfoDouble(ACCOUNT_BALANCE) * (InpRiskPercent / 100.0) * 1.1; // 10% tolerance
-   
-   if(actualRisk > maxRiskAllowed)
+   double maxAllowed = riskAmount * 1.1;
+   if(actualRisk > maxAllowed)
    {
-      Print("BLOCKED: Calculated risk $", actualRisk, " exceeds max $", maxRiskAllowed);
+      Print("BLOCKED: risk $", NormalizeDouble(actualRisk, 2), " > max $", NormalizeDouble(maxAllowed, 2));
       return;
    }
-   
-   //--- Normalize prices
+
    int digits = (int)symInfo.Digits();
    price = NormalizeDouble(price, digits);
    sl    = NormalizeDouble(sl, digits);
    tp    = NormalizeDouble(tp, digits);
-   
-   //--- Send order
+
    bool result = false;
    if(orderType == ORDER_TYPE_BUY)
       result = trade.Buy(lotSize, _Symbol, price, sl, tp, comment);
    else
       result = trade.Sell(lotSize, _Symbol, price, sl, tp, comment);
-   
+
    if(result)
    {
       g_tradesToday++;
@@ -456,101 +633,201 @@ void ExecuteTrade(ENUM_ORDER_TYPE orderType, double price, double sl, double tp,
          g_tradedLongToday = true;
       else
          g_tradedShortToday = true;
-      
-      Print(">>> TRADE OPENED: ", comment, 
-            " | Lots: ", lotSize, 
+
+      Print(">>> TRADE: ", comment,
+            " | Lots: ", lotSize,
             " | Risk: $", NormalizeDouble(actualRisk, 2),
-            " | SL: ", sl, 
-            " | TP: ", tp,
-            " | R:R 1:", InpMinRR);
+            " | SL: ", sl, " | TP: ", tp,
+            " | Trend: ", GetTrendDirection() > 0 ? "BULL" : GetTrendDirection() < 0 ? "BEAR" : "NEUTRAL");
    }
    else
-   {
       Print("!!! TRADE FAILED: ", trade.ResultRetcodeDescription());
-   }
 }
 
 //+------------------------------------------------------------------+
-//| MANAGE open positions — BE moves, trailing                        |
+//| MANAGE open positions — BE, partial TP, trailing                  |
 //+------------------------------------------------------------------+
 void ManageOpenPositions()
 {
    int total = PositionsTotal();
-   
+
    for(int i = total - 1; i >= 0; i--)
    {
       if(!posInfo.SelectByIndex(i)) continue;
-      if(posInfo.Magic() != 240325) continue;  // Only our trades
+      if(posInfo.Magic() != 240325) continue;
       if(posInfo.Symbol() != _Symbol) continue;
-      
-      ulong ticket = posInfo.Ticket();
+
+      ulong  ticket    = posInfo.Ticket();
       double openPrice = posInfo.PriceOpen();
       double currentSL = posInfo.StopLoss();
       double currentTP = posInfo.TakeProfit();
-      double profit    = posInfo.Profit() + posInfo.Swap() + posInfo.Commission();
-      
-      //--- Calculate initial risk distance from open to SL
-      double riskDist = MathAbs(openPrice - currentSL);
+      double volume    = posInfo.Volume();
+      bool   isBuy     = (posInfo.PositionType() == POSITION_TYPE_BUY);
+      double currentPrice = isBuy ? symInfo.Bid() : symInfo.Ask();
+
+      double riskDist  = MathAbs(openPrice - currentSL);
       if(riskDist <= 0) continue;
-      
-      //--- Current price distance from entry
-      double currentPrice = (posInfo.PositionType() == POSITION_TYPE_BUY) ? symInfo.Bid() : symInfo.Ask();
-      double priceDist = 0;
-      
-      if(posInfo.PositionType() == POSITION_TYPE_BUY)
-         priceDist = currentPrice - openPrice;
-      else
-         priceDist = openPrice - currentPrice;
-      
-      //--- Move to Breakeven + buffer at 1:1
-      double bePips = InpBE_PlusPips * _Point * 10; // Convert pips to price distance
-      
-      // For XAUUSD, 1 pip = 0.1, so adjust
+
+      double priceDist = isBuy ? (currentPrice - openPrice) : (openPrice - currentPrice);
+      double currentRR = priceDist / riskDist;
+
+      int digits = (int)symInfo.Digits();
+
+      //--- Calculate pip value for this symbol
+      double bePips = InpBE_PlusPips * _Point * 10;
       if(StringFind(_Symbol, "XAU") >= 0)
          bePips = InpBE_PlusPips * 0.1;
-      
-      if(priceDist >= riskDist * InpBE_TriggerRR)
+
+      //--- 1. PARTIAL TP: Close 50% at target R:R
+      if(InpUsePartialTP && currentRR >= InpPartialTP_RR)
       {
-         double newSL = 0;
-         bool alreadyAtBE = false;
-         
-         if(posInfo.PositionType() == POSITION_TYPE_BUY)
+         if(!IsPartialDone(ticket))
          {
-            newSL = openPrice + bePips;
-            if(currentSL >= openPrice) alreadyAtBE = true; // Already at or past BE
+            double closeLots = NormalizeDouble(volume * (InpPartialTP_Pct / 100.0), 2);
+            double lotStep = symInfo.LotsStep();
+            closeLots = MathFloor(closeLots / lotStep) * lotStep;
+            closeLots = MathMax(symInfo.LotsMin(), closeLots);
+
+            if(closeLots < volume) // Don't close entire position
+            {
+               if(trade.PositionClosePartial(ticket, closeLots))
+               {
+                  MarkPartialDone(ticket);
+                  Print(">>> PARTIAL TP: Ticket #", ticket,
+                        " closed ", closeLots, " lots at ",
+                        NormalizeDouble(InpPartialTP_RR, 1), "R");
+               }
+            }
          }
-         else
-         {
-            newSL = openPrice - bePips;
-            if(currentSL <= openPrice && currentSL > 0) alreadyAtBE = true;
-         }
-         
+      }
+
+      //--- 2. BREAKEVEN: Move SL to entry + buffer
+      if(currentRR >= InpBE_TriggerRR)
+      {
+         double newSL = isBuy ? (openPrice + bePips) : (openPrice - bePips);
+         bool alreadyAtBE = isBuy ? (currentSL >= openPrice) : (currentSL <= openPrice && currentSL > 0);
+
          if(!alreadyAtBE)
          {
-            newSL = NormalizeDouble(newSL, (int)symInfo.Digits());
+            newSL = NormalizeDouble(newSL, digits);
             if(trade.PositionModify(ticket, newSL, currentTP))
-            {
-               Print(">>> BE MOVED: Ticket #", ticket, " SL → ", newSL, " (BE+", InpBE_PlusPips, " pips)");
-            }
+               Print(">>> BE MOVED: #", ticket, " SL → ", newSL);
+         }
+      }
+
+      //--- 3. TRAILING STOP: After partial TP taken, trail in R steps
+      if(InpTrailAfterPartial && IsPartialDone(ticket) && currentRR >= InpPartialTP_RR + InpTrailStepRR)
+      {
+         double trailRR = MathFloor(currentRR / InpTrailStepRR) * InpTrailStepRR - InpTrailStepRR;
+         double trailSL = 0;
+
+         if(isBuy)
+            trailSL = openPrice + (riskDist * trailRR);
+         else
+            trailSL = openPrice - (riskDist * trailRR);
+
+         trailSL = NormalizeDouble(trailSL, digits);
+
+         bool shouldUpdate = isBuy ? (trailSL > currentSL) : (trailSL < currentSL);
+         if(shouldUpdate)
+         {
+            if(trade.PositionModify(ticket, trailSL, currentTP))
+               Print(">>> TRAIL: #", ticket, " SL → ", trailSL, " (", NormalizeDouble(trailRR, 1), "R locked)");
          }
       }
    }
 }
 
 //+------------------------------------------------------------------+
-//| TRADE RESULT TRACKING — called on trade close                     |
+//| MANUAL TRADE BLOCKER                                              |
 //+------------------------------------------------------------------+
-void OnTradeTransaction(const MqlTradeTransaction& trans, 
-                         const MqlTradeRequest& request, 
+void CheckManualTrades()
+{
+   int total = PositionsTotal();
+
+   for(int i = total - 1; i >= 0; i--)
+   {
+      if(!posInfo.SelectByIndex(i)) continue;
+      if(posInfo.Symbol() != _Symbol) continue;
+
+      // Manual trades have magic number 0
+      if(posInfo.Magic() != 0) continue;
+
+      bool shouldBlock = false;
+      string reason = "";
+
+      if(InpBlockManualAlways)
+      {
+         shouldBlock = true;
+         reason = "Guardian mode: all manual trades blocked";
+      }
+      else if(!IsInEntryWindow())
+      {
+         shouldBlock = true;
+         reason = "Manual trade outside allowed session hours";
+      }
+
+      if(shouldBlock)
+      {
+         ulong ticket = posInfo.Ticket();
+         if(trade.PositionClose(ticket))
+         {
+            Print("⛔ BLOCKED MANUAL TRADE: Ticket #", ticket, " — ", reason);
+            Alert("FTMO Guardian blocked a manual trade: ", reason);
+         }
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| SESSION EXIT — Close trades at end of NY                          |
+//+------------------------------------------------------------------+
+void CheckSessionExit()
+{
+   MqlDateTime dt;
+   TimeCurrent(dt);
+
+   if(dt.hour < InpNYEndHour) return;
+
+   int total = PositionsTotal();
+   for(int i = total - 1; i >= 0; i--)
+   {
+      if(!posInfo.SelectByIndex(i)) continue;
+      if(posInfo.Magic() != 240325) continue;
+      if(posInfo.Symbol() != _Symbol) continue;
+
+      // Check if SL is already at or past breakeven
+      double openPrice = posInfo.PriceOpen();
+      double currentSL = posInfo.StopLoss();
+      bool isBuy = (posInfo.PositionType() == POSITION_TYPE_BUY);
+      bool atBE = isBuy ? (currentSL >= openPrice) : (currentSL > 0 && currentSL <= openPrice);
+
+      // If already at BE+ with partial taken, let it ride until hard TP
+      // Otherwise close to avoid overnight risk
+      if(!atBE || !IsPartialDone(posInfo.Ticket()))
+      {
+         ulong ticket = posInfo.Ticket();
+         double profit = posInfo.Profit() + posInfo.Swap() + posInfo.Commission();
+         if(trade.PositionClose(ticket))
+         {
+            Print(">>> SESSION EXIT: #", ticket, " closed at NY end. P&L: $",
+                  NormalizeDouble(profit, 2));
+         }
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| TRADE RESULT TRACKING                                             |
+//+------------------------------------------------------------------+
+void OnTradeTransaction(const MqlTradeTransaction& trans,
+                         const MqlTradeRequest& request,
                          const MqlTradeResult& result)
 {
-   //--- Track wins/losses for kill switch
    if(trans.type == TRADE_TRANSACTION_DEAL_ADD)
    {
-      //--- Check if it's a close deal (entry=out)
       if(trans.deal_type == DEAL_TYPE_BUY || trans.deal_type == DEAL_TYPE_SELL)
       {
-         //--- Get deal info
          if(HistoryDealSelect(trans.deal))
          {
             ENUM_DEAL_ENTRY entry = (ENUM_DEAL_ENTRY)HistoryDealGetInteger(trans.deal, DEAL_ENTRY);
@@ -558,24 +835,23 @@ void OnTradeTransaction(const MqlTradeTransaction& trans,
             {
                double dealProfit = HistoryDealGetDouble(trans.deal, DEAL_PROFIT);
                long   dealMagic  = HistoryDealGetInteger(trans.deal, DEAL_MAGIC);
-               
+
                if(dealMagic == 240325)
                {
                   if(dealProfit >= 0)
                   {
                      g_consecLosses = 0;
-                     Print("--- Trade closed: WIN $", dealProfit, " | Consecutive losses reset.");
+                     Print("✓ WIN: +$", NormalizeDouble(dealProfit, 2),
+                           " | Streak reset");
                   }
                   else
                   {
                      g_consecLosses++;
-                     Print("--- Trade closed: LOSS $", dealProfit, " | Consecutive losses: ", g_consecLosses);
-                     
+                     Print("✗ LOSS: $", NormalizeDouble(dealProfit, 2),
+                           " | Streak: ", g_consecLosses, "/", InpMaxConsecLosses);
+
                      if(g_consecLosses >= InpMaxConsecLosses)
-                     {
-                        g_killSwitchActive = true;
-                        Alert("FTMO Guardian: ", g_consecLosses, " consecutive losses. Kill switch engaged.");
-                     }
+                        EngageKillSwitch(IntegerToString(g_consecLosses) + " consecutive losses");
                   }
                }
             }
@@ -585,93 +861,118 @@ void OnTradeTransaction(const MqlTradeTransaction& trans,
 }
 
 //+------------------------------------------------------------------+
-//| HELPER: Count open positions with our magic number                |
+//| KILL SWITCH                                                       |
 //+------------------------------------------------------------------+
+void EngageKillSwitch(string reason)
+{
+   if(g_killSwitchActive) return;
+   g_killSwitchActive = true;
+   g_killReason = reason;
+   Print("⛔ KILL SWITCH ENGAGED: ", reason);
+   Alert("FTMO Guardian: KILL SWITCH — ", reason);
+}
+
+//+------------------------------------------------------------------+
+//| HELPERS                                                           |
+//+------------------------------------------------------------------+
+
 int CountOpenPositions()
 {
    int count = 0;
    for(int i = PositionsTotal() - 1; i >= 0; i--)
    {
       if(posInfo.SelectByIndex(i))
-      {
          if(posInfo.Magic() == 240325 && posInfo.Symbol() == _Symbol)
             count++;
-      }
    }
    return count;
 }
 
-//+------------------------------------------------------------------+
-//| HELPER: Get today's realized + unrealized PnL                     |
-//+------------------------------------------------------------------+
 double GetDailyPnL()
 {
    double pnl = 0;
-   
-   //--- Unrealized PnL from open positions
+
+   // Unrealized
    for(int i = PositionsTotal() - 1; i >= 0; i--)
    {
       if(posInfo.SelectByIndex(i))
-      {
          if(posInfo.Magic() == 240325)
             pnl += posInfo.Profit() + posInfo.Swap() + posInfo.Commission();
-      }
    }
-   
-   //--- Realized PnL from today's closed trades
+
+   // Realized today
    datetime todayStart = StringToTime(TimeToString(TimeCurrent(), TIME_DATE));
    HistorySelect(todayStart, TimeCurrent());
-   
-   int totalDeals = HistoryDealsTotal();
-   for(int i = 0; i < totalDeals; i++)
+
+   for(int i = 0; i < HistoryDealsTotal(); i++)
    {
       ulong dealTicket = HistoryDealGetTicket(i);
-      if(dealTicket > 0)
+      if(dealTicket > 0 && HistoryDealGetInteger(dealTicket, DEAL_MAGIC) == 240325)
       {
-         if(HistoryDealGetInteger(dealTicket, DEAL_MAGIC) == 240325)
+         ENUM_DEAL_ENTRY entry = (ENUM_DEAL_ENTRY)HistoryDealGetInteger(dealTicket, DEAL_ENTRY);
+         if(entry == DEAL_ENTRY_OUT || entry == DEAL_ENTRY_INOUT)
          {
-            ENUM_DEAL_ENTRY entry = (ENUM_DEAL_ENTRY)HistoryDealGetInteger(dealTicket, DEAL_ENTRY);
-            if(entry == DEAL_ENTRY_OUT || entry == DEAL_ENTRY_INOUT)
-            {
-               pnl += HistoryDealGetDouble(dealTicket, DEAL_PROFIT) +
-                      HistoryDealGetDouble(dealTicket, DEAL_SWAP) +
-                      HistoryDealGetDouble(dealTicket, DEAL_COMMISSION);
-            }
+            pnl += HistoryDealGetDouble(dealTicket, DEAL_PROFIT) +
+                   HistoryDealGetDouble(dealTicket, DEAL_SWAP) +
+                   HistoryDealGetDouble(dealTicket, DEAL_COMMISSION);
          }
       }
    }
-   
+
    return pnl;
 }
 
-//+------------------------------------------------------------------+
-//| HELPER: Check if current time is in a trading session             |
-//+------------------------------------------------------------------+
-bool IsInTradingSession()
+bool IsInEntryWindow()
 {
    MqlDateTime dt;
    TimeCurrent(dt);
    int hour = dt.hour;
-   
+
    if(InpTradeLondon && hour >= InpLondonStartHour && hour < InpLondonEndHour)
       return true;
-   
    if(InpTradeNY && hour >= InpNYStartHour && hour < InpNYEndHour)
       return true;
-   
+
    return false;
 }
 
+//--- Partial TP tracking
+bool IsPartialDone(ulong ticket)
+{
+   for(int i = 0; i < g_partialCount; i++)
+      if(g_partialDone_Tickets[i] == ticket)
+         return g_partialDone_Flags[i];
+   return false;
+}
+
+void MarkPartialDone(ulong ticket)
+{
+   // Check if already tracked
+   for(int i = 0; i < g_partialCount; i++)
+   {
+      if(g_partialDone_Tickets[i] == ticket)
+      {
+         g_partialDone_Flags[i] = true;
+         return;
+      }
+   }
+   // Add new entry
+   if(g_partialCount < MAX_TRACKED_TICKETS)
+   {
+      g_partialDone_Tickets[g_partialCount] = ticket;
+      g_partialDone_Flags[g_partialCount] = true;
+      g_partialCount++;
+   }
+}
+
 //+------------------------------------------------------------------+
-//| DRAW Asian session box on chart                                   |
+//| DRAW Asian range box                                              |
 //+------------------------------------------------------------------+
 void DrawAsianBox(datetime startTime, datetime endTime, double high, double low)
 {
-   string name = g_dashPrefix + "AsianBox_" + TimeToString(startTime, TIME_DATE);
-   
-   //--- Extend box to end of day for visibility
-   datetime extendEnd = endTime + 12 * 3600;
-   
+   string name = g_dashPrefix + "ABox_" + TimeToString(startTime, TIME_DATE);
+   datetime extendEnd = endTime + 14 * 3600;
+
    ObjectCreate(0, name, OBJ_RECTANGLE, 0, startTime, high, extendEnd, low);
    ObjectSetInteger(0, name, OBJPROP_COLOR, InpAsianBoxColor);
    ObjectSetInteger(0, name, OBJPROP_STYLE, STYLE_DOT);
@@ -679,72 +980,135 @@ void DrawAsianBox(datetime startTime, datetime endTime, double high, double low)
    ObjectSetInteger(0, name, OBJPROP_FILL, true);
    ObjectSetInteger(0, name, OBJPROP_BACK, true);
    ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
-   
-   //--- High line
-   string highName = g_dashPrefix + "AsianHigh_" + TimeToString(startTime, TIME_DATE);
-   ObjectCreate(0, highName, OBJ_HLINE, 0, 0, high);
-   ObjectSetInteger(0, highName, OBJPROP_COLOR, clrDodgerBlue);
-   ObjectSetInteger(0, highName, OBJPROP_STYLE, STYLE_DASH);
-   ObjectSetInteger(0, highName, OBJPROP_WIDTH, 1);
-   ObjectSetInteger(0, highName, OBJPROP_BACK, true);
-   
-   //--- Low line  
-   string lowName = g_dashPrefix + "AsianLow_" + TimeToString(startTime, TIME_DATE);
-   ObjectCreate(0, lowName, OBJ_HLINE, 0, 0, low);
-   ObjectSetInteger(0, lowName, OBJPROP_COLOR, clrOrangeRed);
-   ObjectSetInteger(0, lowName, OBJPROP_STYLE, STYLE_DASH);
-   ObjectSetInteger(0, lowName, OBJPROP_WIDTH, 1);
-   ObjectSetInteger(0, lowName, OBJPROP_BACK, true);
+
+   // High level
+   string hName = g_dashPrefix + "AHi_" + TimeToString(startTime, TIME_DATE);
+   ObjectCreate(0, hName, OBJ_HLINE, 0, 0, high);
+   ObjectSetInteger(0, hName, OBJPROP_COLOR, clrDodgerBlue);
+   ObjectSetInteger(0, hName, OBJPROP_STYLE, STYLE_DASH);
+   ObjectSetInteger(0, hName, OBJPROP_WIDTH, 1);
+   ObjectSetInteger(0, hName, OBJPROP_BACK, true);
+
+   // Low level
+   string lName = g_dashPrefix + "ALo_" + TimeToString(startTime, TIME_DATE);
+   ObjectCreate(0, lName, OBJ_HLINE, 0, 0, low);
+   ObjectSetInteger(0, lName, OBJPROP_COLOR, clrOrangeRed);
+   ObjectSetInteger(0, lName, OBJPROP_STYLE, STYLE_DASH);
+   ObjectSetInteger(0, lName, OBJPROP_WIDTH, 1);
+   ObjectSetInteger(0, lName, OBJPROP_BACK, true);
 }
 
 //+------------------------------------------------------------------+
-//| UPDATE on-chart dashboard                                         |
+//| DASHBOARD — on-chart display with server time                     |
 //+------------------------------------------------------------------+
 void UpdateDashboard()
 {
    double balance  = AccountInfoDouble(ACCOUNT_BALANCE);
    double equity   = AccountInfoDouble(ACCOUNT_EQUITY);
    double dailyPnL = GetDailyPnL();
-   double dailyPct = (dailyPnL / g_startingBalance) * 100.0;
-   double totalDD  = ((g_challengeStartBalance - equity) / g_challengeStartBalance) * 100.0;
+   double dailyPct = (g_startingBalance > 0) ? (dailyPnL / g_startingBalance) * 100.0 : 0;
+   double totalDD  = (g_challengeStartBalance > 0) ?
+                     ((g_challengeStartBalance - equity) / g_challengeStartBalance) * 100.0 : 0;
    int    openPos  = CountOpenPositions();
-   
-   string sessionStr = IsInTradingSession() ? "ACTIVE" : "CLOSED";
-   string killStr    = g_killSwitchActive ? ">>> ENGAGED <<<" : "OFF";
-   string rangeStr   = g_asianRangeSet ? 
-                        StringFormat("%.2f — %.2f", g_asianLow, g_asianHigh) : 
-                        "Not set";
-   
+
+   //--- Server time
+   MqlDateTime dt;
+   TimeCurrent(dt);
+   string serverTime = StringFormat("%04d-%02d-%02d  %02d:%02d:%02d",
+                        dt.year, dt.mon, dt.day, dt.hour, dt.min, dt.sec);
+   string dayNames[] = {"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"};
+   string dayName = dayNames[dt.day_of_week];
+
+   //--- Status strings
+   string sessionStr = IsInEntryWindow() ? "● ACTIVE" : "○ CLOSED";
+   string killStr    = g_killSwitchActive ? ">>> " + g_killReason + " <<<" : "OFF";
+   string trendStr   = "—";
+   int td = GetTrendDirection();
+   if(td > 0)       trendStr = "▲ BULLISH";
+   else if(td < 0)  trendStr = "▼ BEARISH";
+   else              trendStr = "◆ NEUTRAL";
+
+   string rangeStr = g_asianRangeSet ?
+      StringFormat("%.2f — %.2f (%.0f pts)", g_asianLow, g_asianHigh,
+                    (g_asianHigh - g_asianLow) / _Point) :
+      "Not set";
+
+   //--- Spread
+   int spread = (int)symInfo.Spread();
+   string spreadStr = IntegerToString(spread) + " pts";
+   if(InpUseSpreadFilter)
+      spreadStr += (spread <= InpMaxSpreadPoints) ? " ✓" : " ✗";
+
+   //--- Progress toward target
+   double profitFromStart = equity - g_challengeStartBalance;
+   double targetAmount = g_challengeStartBalance * 0.10; // 10% target
+   double progressPct = (targetAmount > 0) ? (profitFromStart / targetAmount) * 100.0 : 0;
+
    string dashText = StringFormat(
-      "═══════════════════════════════════\n"
-      "       FTMO GUARDIAN v1.0\n"
-      "═══════════════════════════════════\n"
-      "Balance:        $%.2f\n"
-      "Equity:         $%.2f\n"
-      "Daily P&L:      $%.2f  (%.2f%%)\n"
-      "Total DD:       %.2f%%  / %.1f%% max\n"
-      "═══════════════════════════════════\n"
-      "Session:        %s\n"
-      "Asian Range:    %s\n"
-      "Trades Today:   %d / %d\n"
-      "Open Positions: %d / %d\n"
-      "Consec Losses:  %d / %d\n"
-      "Kill Switch:    %s\n"
-      "Risk/Trade:     %.1f%% ($%.0f)\n"
-      "═══════════════════════════════════",
-      balance, equity,
-      dailyPnL, dailyPct,
-      totalDD, InpMaxDrawdownPct,
+      "═══════════════════════════════════════════\n"
+      "       FTMO GUARDIAN v2.0 — %s\n"
+      "       Server: %s  %s\n"
+      "═══════════════════════════════════════════\n"
+      " Balance:       $%s\n"
+      " Equity:        $%s\n"
+      " Daily P&&L:     $%s  (%s%%)\n"
+      " Drawdown:      %s%%  /  %.1f%% max\n"
+      "───────────────────────────────────────────\n"
+      " Challenge:     $%s  →  target $%s\n"
+      " Progress:      %s%%\n"
+      "───────────────────────────────────────────\n"
+      " H4 Trend:      %s\n"
+      " Session:       %s\n"
+      " Asian Range:   %s\n"
+      " Spread:        %s\n"
+      "───────────────────────────────────────────\n"
+      " Trades Today:  %d / %d\n"
+      " Open:          %d / %d\n"
+      " Consec Losses: %d / %d\n"
+      " Kill Switch:   %s\n"
+      " Risk/Trade:    %.1f%%  ($%.0f)\n"
+      "═══════════════════════════════════════════",
+      _Symbol,
+      serverTime, dayName,
+      FormatMoney(balance), FormatMoney(equity),
+      FormatMoney(dailyPnL), DoubleToString(dailyPct, 2),
+      DoubleToString(totalDD, 2), InpMaxDrawdownPct,
+      FormatMoney(g_challengeStartBalance), FormatMoney(g_challengeStartBalance * 1.10),
+      DoubleToString(progressPct, 1),
+      trendStr,
       sessionStr,
       rangeStr,
+      spreadStr,
       g_tradesToday, InpMaxTradesPerDay,
       openPos, InpMaxOpenPositions,
       g_consecLosses, InpMaxConsecLosses,
       killStr,
       InpRiskPercent, balance * (InpRiskPercent / 100.0)
    );
-   
+
    Comment(dashText);
+}
+
+//--- Format number with commas
+string FormatMoney(double value)
+{
+   string str = DoubleToString(MathAbs(value), 2);
+   string sign = (value < 0) ? "-" : "";
+
+   // Insert commas
+   int dotPos = StringFind(str, ".");
+   string intPart = StringSubstr(str, 0, dotPos);
+   string decPart = StringSubstr(str, dotPos);
+
+   string result = "";
+   int len = StringLen(intPart);
+   for(int i = 0; i < len; i++)
+   {
+      if(i > 0 && (len - i) % 3 == 0) result += ",";
+      result += StringSubstr(intPart, i, 1);
+   }
+
+   return sign + result + decPart;
 }
 
 //+------------------------------------------------------------------+
