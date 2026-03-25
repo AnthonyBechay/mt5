@@ -42,7 +42,7 @@
 //+------------------------------------------------------------------+
 #property copyright "Anthony — FTMO Challenge"
 #property link      "https://github.com/AnthonyBechay/mt5"
-#property version   "3.10"
+#property version   "3.20"
 #property strict
 #property description "Semi-discretionary FTMO trade tool."
 #property description "Shift+B = Buy, Shift+S = Sell, Shift+X = Close All"
@@ -116,8 +116,10 @@ input int      InpMaxConsecLosses    = 3;       // Consec losses → stop today
 input group "══════ MANUAL TRADE BLOCKER ══════"
 input bool     InpBlockManualOutside = true;    // Block clicking Buy/Sell outside hours
 
-input group "══════ TREND DISPLAY ══════"
-input int      InpEMA_Period         = 50;      // H4 EMA period (display + guidance)
+input group "══════ TREND DETECTION (H4) ══════"
+input int      InpEMA_Period         = 50;      // H4 EMA period
+input int      InpEMA_SlopeCandles   = 5;       // EMA slope lookback (H4 candles)
+input double   InpEMA_SlopeMinPts    = 30;      // Min EMA slope (points over lookback)
 input bool     InpShowSLPreview      = true;    // Show SL/TP preview lines on chart
 
 //+------------------------------------------------------------------+
@@ -888,15 +890,76 @@ double GetCurrentATR()
    return buf[0];
 }
 
+//+------------------------------------------------------------------+
+//| TREND DETECTION — 3-factor confirmation                          |
+//|                                                                   |
+//| Factor 1: Price vs EMA (is price above or below?)               |
+//| Factor 2: EMA slope (is the EMA itself trending or flat?)       |
+//| Factor 3: H4 structure (higher highs/lows or lower?)            |
+//|                                                                   |
+//| Returns: +1 = confirmed bullish                                  |
+//|          -1 = confirmed bearish                                  |
+//|           0 = conflicting/neutral → don't trade                  |
+//|                                                                   |
+//| g_trendDetail is set for dashboard display                       |
+//+------------------------------------------------------------------+
+string g_trendDetail = "";
+
 int GetTrendDirection()
 {
+   //--- Factor 1: Price position vs EMA
    double ema[];
    ArraySetAsSeries(ema, true);
-   if(CopyBuffer(g_hEMA_H4, 0, 0, 1, ema) < 1) return 0;
+   int emaBars = InpEMA_SlopeCandles + 2;
+   if(CopyBuffer(g_hEMA_H4, 0, 0, emaBars, ema) < emaBars) return 0;
+
    double price = symInfo.Bid();
-   if(price > ema[0]) return +1;
-   if(price < ema[0]) return -1;
-   return 0;
+   int priceVsEMA = 0;
+   if(price > ema[0]) priceVsEMA = +1;
+   else if(price < ema[0]) priceVsEMA = -1;
+
+   //--- Factor 2: EMA slope (is it actually moving?)
+   double slopePoints = (ema[0] - ema[InpEMA_SlopeCandles]) / _Point;
+   int slopeDir = 0;
+   if(slopePoints > InpEMA_SlopeMinPts) slopeDir = +1;       // EMA rising
+   else if(slopePoints < -InpEMA_SlopeMinPts) slopeDir = -1;  // EMA falling
+   // else slopeDir = 0 → EMA is flat, no trend
+
+   //--- Factor 3: H4 candle structure (last 3 completed H4 candles)
+   double h4High[], h4Low[];
+   ArraySetAsSeries(h4High, true);
+   ArraySetAsSeries(h4Low, true);
+   if(CopyHigh(_Symbol, PERIOD_H4, 1, 4, h4High) < 4) return 0;
+   if(CopyLow(_Symbol, PERIOD_H4, 1, 4, h4Low) < 4) return 0;
+
+   // Check for higher highs + higher lows (bullish structure)
+   // or lower highs + lower lows (bearish structure)
+   bool higherHighs = (h4High[0] > h4High[1]) && (h4High[1] > h4High[2]);
+   bool higherLows  = (h4Low[0] > h4Low[1]) && (h4Low[1] > h4Low[2]);
+   bool lowerHighs  = (h4High[0] < h4High[1]) && (h4High[1] < h4High[2]);
+   bool lowerLows   = (h4Low[0] < h4Low[1]) && (h4Low[1] < h4Low[2]);
+
+   int structureDir = 0;
+   if(higherHighs && higherLows)  structureDir = +1;  // Bullish structure
+   else if(higherHighs || higherLows) structureDir = +1; // Partial bullish
+   if(lowerHighs && lowerLows)    structureDir = -1;  // Bearish structure
+   else if(lowerHighs || lowerLows) structureDir = -1; // Partial bearish
+
+   //--- Combine factors: need at least 2 of 3 to agree
+   int bullScore = 0, bearScore = 0;
+   if(priceVsEMA > 0) bullScore++; else if(priceVsEMA < 0) bearScore++;
+   if(slopeDir > 0)   bullScore++; else if(slopeDir < 0)   bearScore++;
+   if(structureDir > 0) bullScore++; else if(structureDir < 0) bearScore++;
+
+   //--- Build detail string for dashboard
+   string p = (priceVsEMA > 0) ? "+Price" : (priceVsEMA < 0) ? "-Price" : "~Price";
+   string s = (slopeDir > 0) ? "+Slope" : (slopeDir < 0) ? "-Slope" : "~Slope(flat)";
+   string st = (structureDir > 0) ? "+HH/HL" : (structureDir < 0) ? "-LH/LL" : "~Ranging";
+   g_trendDetail = p + " " + s + " " + st;
+
+   if(bullScore >= 2 && bearScore == 0) return +1;  // Confirmed bullish
+   if(bearScore >= 2 && bullScore == 0) return -1;  // Confirmed bearish
+   return 0;  // Mixed signals → stay out
 }
 
 int CountOpenPositions()
@@ -1007,6 +1070,7 @@ void UpdateDashboard()
    int trend = GetTrendDirection();
    string trendStr = (trend > 0) ? "BULLISH — look for BUYS only" :
                      (trend < 0) ? "BEARISH — look for SELLS only" : "NEUTRAL — NO TRADES today";
+   string trendFactors = g_trendDetail;  // Shows which factors agree/disagree
 
    double atr = GetCurrentATR();
    double slDist = atr * InpSL_ATR_Multiplier;
@@ -1065,7 +1129,7 @@ void UpdateDashboard()
 
    string dash = StringFormat(
       "=====================================================\n"
-      "  FTMO GUARDIAN v3.1 — %s\n"
+      "  FTMO GUARDIAN v3.2 — %s\n"
       "  Server: %s %04d-%02d-%02d  %02d:%02d:%02d\n"
       "  Local:  %02d:%02d  (UTC%+d)\n"
       "=====================================================\n"
@@ -1075,6 +1139,7 @@ void UpdateDashboard()
       "\n"
       "  ── WHAT TO DO NOW ──\n"
       "  H4 Trend:    %s\n"
+      "  Factors:     [%s]\n"
       "  Session:     %s\n"
       "  >> %s\n"
       "\n"
@@ -1109,6 +1174,7 @@ void UpdateDashboard()
       days[dt.day_of_week], dt.year, dt.mon, dt.day, dt.hour, dt.min, dt.sec,
       localHour, dt.min, InpLocalUTC_Offset,
       trendStr,
+      trendFactors,
       sessionStr,
       whatToDo,
       Fmt(balance), Fmt(equity),
