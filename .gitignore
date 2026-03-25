@@ -1,0 +1,14 @@
+# Compiled EAs
+*.ex5
+*.ex4
+
+# macOS
+.DS_Store
+
+# MT5 generated folders
+Logs/
+Tester/
+
+# Settings and chart files
+*.set
+*.chr
