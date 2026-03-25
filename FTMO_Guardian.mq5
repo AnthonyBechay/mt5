@@ -1,34 +1,48 @@
 //+------------------------------------------------------------------+
-//|                                          FTMO_Guardian v3.0.mq5  |
+//|                                          FTMO_Guardian v3.1.mq5  |
 //|                              Anthony's FTMO Challenge Guardian    |
 //|                                                                   |
-//|  Mode:    Semi-Discretionary Trade Management Tool                |
-//|  YOU decide when to trade. The EA handles risk perfectly.         |
+//|  Technique: TREND PULLBACK — Buy dips, sell rallies              |
+//|  Instrument: XAUUSD (Gold)                                       |
+//|  Style: Relaxed semi-swing, 2-4 trades/week                      |
 //|                                                                   |
-//|  Shift+B  = BUY  (auto lot size, auto SL from ATR)              |
-//|  Shift+S  = SELL (auto lot size, auto SL from ATR)              |
-//|  Shift+X  = CLOSE all positions                                  |
-//|  Shift+E  = Move all to breakeven NOW                            |
+//|  ─── YOUR DAILY ROUTINE ───                                      |
 //|                                                                   |
-//|  The EA:                                                          |
-//|   - Calculates position size from your risk %                    |
-//|   - Sets SL using ATR (adapts to current volatility)             |
-//|   - Sets TP at your chosen R:R ratio                             |
-//|   - Moves to breakeven automatically at target R:R               |
-//|   - Trails stop in R-multiple steps                              |
-//|   - Blocks trades outside your session hours                     |
-//|   - Enforces daily loss cap and max drawdown                     |
-//|   - Shows everything on the dashboard so you stay informed       |
+//|  BEFORE SESSION (30 min before London open):                     |
+//|   1. Check dashboard → H4 trend BULLISH or BEARISH?             |
+//|      Bullish = only look for BUYS today                          |
+//|      Bearish = only look for SELLS today                         |
+//|      Neutral = sit on your hands, no trades                      |
 //|                                                                   |
-//|  You:                                                             |
-//|   - Read the H4 trend (shown on dashboard)                       |
-//|   - Watch for price to reach your level                          |
-//|   - Press Shift+B or Shift+S when the setup looks right          |
-//|   - Walk away. The EA manages the rest.                          |
+//|   2. Mark your levels: Asian range high/low (drawn by EA),       |
+//|      recent H4 support/resistance, round numbers ($2600, $2650)  |
+//|                                                                   |
+//|  DURING SESSION (London 11:00-14:00 / NY 16:30-19:00 server):   |
+//|   3. WAIT for price to PULL BACK toward a level:                 |
+//|      - If bullish: wait for dip to support / Asian low / EMA     |
+//|      - If bearish: wait for rally to resistance / Asian high     |
+//|                                                                   |
+//|   4. WATCH for rejection: H1 pin bar, engulfing candle,          |
+//|      strong close away from the level = the market said NO       |
+//|                                                                   |
+//|   5. ENTER: Press Shift+B (buy) or Shift+S (sell)               |
+//|      EA handles SL, TP, lot size, everything.                    |
+//|                                                                   |
+//|   6. WALK AWAY. EA moves to BE at 1.5R, trails after that.      |
+//|                                                                   |
+//|  WHAT TO AVOID:                                                  |
+//|   - Chasing: if price already moved 2%+, the move is done       |
+//|   - Counter-trend: NEVER buy in a bearish trend or vice versa   |
+//|   - Revenge: lost a trade? The EA stops you after 3 losses      |
+//|   - Overtrading: 2-3 trades per day MAX, fewer is better        |
+//|                                                                   |
+//|  ─── KEYBOARD SHORTCUTS ───                                      |
+//|   Shift+B = BUY    Shift+S = SELL                               |
+//|   Shift+X = CLOSE  Shift+E = BREAKEVEN                          |
 //+------------------------------------------------------------------+
 #property copyright "Anthony — FTMO Challenge"
 #property link      "https://github.com/AnthonyBechay/mt5"
-#property version   "3.00"
+#property version   "3.10"
 #property strict
 #property description "Semi-discretionary FTMO trade tool."
 #property description "Shift+B = Buy, Shift+S = Sell, Shift+X = Close All"
@@ -56,11 +70,13 @@ input double   InpMaxDrawdownPct     = 8.0;     // Our max DD stop % (inside FTM
 input int      InpMaxTradesPerDay    = 3;       // Max trades per day
 input int      InpMaxOpenPositions   = 2;       // Max simultaneous positions
 
-input group "══════ SL / TP (ATR-Based) ══════"
+input group "══════ SL / TP (ATR-Based with Caps) ══════"
 input double   InpSL_ATR_Multiplier  = 1.5;    // SL = X times ATR(14) on H1
 input double   InpTargetRR           = 3.0;     // TP = SL distance x this R:R
 input int      InpATR_Period         = 14;      // ATR period for SL calculation
 input ENUM_TIMEFRAMES InpATR_TF      = PERIOD_H1; // ATR timeframe
+input double   InpMinSL_Points       = 800;    // Min SL distance (points) — floor
+input double   InpMaxSL_Points       = 3000;   // Max SL distance (points) — ceiling
 
 input group "══════ TRADE MANAGEMENT ══════"
 input double   InpBE_TriggerRR       = 1.5;    // Move to BE at this R:R
@@ -68,19 +84,21 @@ input double   InpBE_PlusPips        = 2.0;    // Lock BE + X pips
 input bool     InpTrailAfterBE       = true;    // Trail stop after BE
 input double   InpTrailStepRR        = 0.5;    // Trail step in R multiples
 
-input group "══════ SESSION HOURS ══════"
-input int      InpLondonStartHour    = 8;       // London entry window start
-input int      InpLondonEndHour      = 11;      // London entry window end
-input int      InpNYStartHour        = 13;      // NY entry window start
-input int      InpNYEndHour          = 16;      // NY session end
+input group "══════ SESSION HOURS (Server UTC+3) ══════"
+input int      InpServerUTC_Offset   = 3;       // Server UTC offset (your broker)
+input int      InpLocalUTC_Offset    = 2;       // Your local UTC offset (Lebanon=2)
+input int      InpLondonStartHour    = 11;      // London open (server hour) — 8AM London
+input int      InpLondonEndHour      = 14;      // London entry cutoff (server)
+input int      InpNYStartHour        = 16;      // NY open (server hour) — 9:30AM NY
+input int      InpNYEndHour          = 20;      // NY close (server hour) — close all
 input bool     InpTradeLondon        = true;    // Allow London entries
 input bool     InpTradeNY            = true;    // Allow NY entries
 input bool     InpCloseEndOfNY       = true;    // Close all at NY end
 
-input group "══════ ASIAN RANGE (Visual Only) ══════"
+input group "══════ ASIAN RANGE (Visual Reference) ══════"
 input bool     InpDrawAsianRange     = true;    // Draw Asian range on chart
-input int      InpAsianStartHour     = 0;       // Asian range start
-input int      InpAsianEndHour       = 7;       // Asian range end
+input int      InpAsianStartHour     = 2;       // Asian start (server) — midnight UTC
+input int      InpAsianEndHour       = 10;      // Asian end (server) — 7AM UTC
 input color    InpAsianBoxColor      = C'25,35,45';
 
 input group "══════ FILTERS ══════"
@@ -90,7 +108,7 @@ input bool     InpUseNewsFilter      = true;    // Pause near high-impact news
 input int      InpNewsMinutesBefore  = 30;      // Minutes before news
 input int      InpNewsMinutesAfter   = 15;      // Minutes after news
 input bool     InpFridayFilter       = true;    // No trades Friday afternoon
-input int      InpFridayCutoffHour   = 12;      // Friday cutoff hour
+input int      InpFridayCutoffHour   = 15;      // Friday cutoff (server) — noon London
 
 input group "══════ KILL SWITCH ══════"
 input int      InpMaxConsecLosses    = 3;       // Consec losses → stop today
@@ -384,7 +402,7 @@ void ExecuteManualEntry(ENUM_ORDER_TYPE orderType)
 
    //--- ALL GATES PASSED — Calculate and execute
 
-   //--- Get ATR for SL distance
+   //--- Get ATR for SL distance (capped to min/max)
    double atrValue = GetCurrentATR();
    if(atrValue <= 0)
    {
@@ -394,6 +412,23 @@ void ExecuteManualEntry(ENUM_ORDER_TYPE orderType)
    }
 
    double slDistance = atrValue * InpSL_ATR_Multiplier;
+
+   //--- Apply SL caps — prevents too tight or too wide stops
+   double minSL = InpMinSL_Points * _Point;
+   double maxSL = InpMaxSL_Points * _Point;
+   string slNote = "";
+
+   if(slDistance < minSL)
+   {
+      slNote = StringFormat(" (ATR too tight %.0f pts, floored to %.0f)", slDistance / _Point, InpMinSL_Points);
+      slDistance = minSL;
+   }
+   else if(slDistance > maxSL)
+   {
+      slNote = StringFormat(" (ATR too wide %.0f pts, capped to %.0f)", slDistance / _Point, InpMaxSL_Points);
+      slDistance = maxSL;
+   }
+
    double price = (orderType == ORDER_TYPE_BUY) ? symInfo.Ask() : symInfo.Bid();
 
    //--- Calculate SL and TP
@@ -452,9 +487,9 @@ void ExecuteManualEntry(ENUM_ORDER_TYPE orderType)
    if(result)
    {
       g_tradesToday++;
-      g_lastAction = StringFormat("%s EXECUTED: %.2f lots | Risk $%.0f (%.1f%%) | SL %.2f (%.0f pts) | TP %.2f (1:%.1f)",
+      g_lastAction = StringFormat("%s EXECUTED: %.2f lots | Risk $%.0f (%.1f%%) | SL %.2f (%.0f pts) | TP %.2f (1:%.1f)%s",
                       dir, lotSize, actualRisk, InpRiskPercent,
-                      sl, slDistance / _Point, tp, InpTargetRR);
+                      sl, slDistance / _Point, tp, InpTargetRR, slNote);
       Print(">>> ", g_lastAction);
    }
    else
@@ -672,6 +707,9 @@ void DrawSLTPPreview()
    if(atr <= 0) return;
 
    double slDist = atr * InpSL_ATR_Multiplier;
+   // Apply same caps as execution
+   slDist = MathMax(slDist, InpMinSL_Points * _Point);
+   slDist = MathMin(slDist, InpMaxSL_Points * _Point);
    double bid = symInfo.Bid();
    double ask = symInfo.Ask();
 
@@ -961,43 +999,84 @@ void UpdateDashboard()
    TimeCurrent(dt);
    string days[] = {"Sun","Mon","Tue","Wed","Thu","Fri","Sat"};
 
+   // Local time calculation
+   int localHour = dt.hour - InpServerUTC_Offset + InpLocalUTC_Offset;
+   if(localHour < 0) localHour += 24;
+   if(localHour >= 24) localHour -= 24;
+
    int trend = GetTrendDirection();
-   string trendStr = (trend > 0) ? "BULLISH (above EMA50)" :
-                     (trend < 0) ? "BEARISH (below EMA50)" : "NEUTRAL (at EMA50)";
+   string trendStr = (trend > 0) ? "BULLISH — look for BUYS only" :
+                     (trend < 0) ? "BEARISH — look for SELLS only" : "NEUTRAL — NO TRADES today";
 
    double atr = GetCurrentATR();
    double slDist = atr * InpSL_ATR_Multiplier;
+   slDist = MathMax(slDist, InpMinSL_Points * _Point);
+   slDist = MathMin(slDist, InpMaxSL_Points * _Point);
    double riskAmt = balance * (InpRiskPercent / 100.0);
    int spread = (int)symInfo.Spread();
 
-   string sessionStr = IsInEntryWindow() ? ">> OPEN — You can trade <<" : "Closed — Shift+B/S blocked";
+   // Session status with guidance
+   string sessionStr = "";
+   string whatToDo = "";
+   if(IsInEntryWindow())
+   {
+      sessionStr = ">> OPEN <<";
+      if(trend > 0)
+         whatToDo = "Look for pullback to support. See bounce? Shift+B";
+      else if(trend < 0)
+         whatToDo = "Look for rally to resistance. See rejection? Shift+S";
+      else
+         whatToDo = "No clear trend. Stay flat, protect capital.";
+   }
+   else
+   {
+      sessionStr = "CLOSED";
+      if(dt.hour < InpLondonStartHour)
+         whatToDo = StringFormat("Next window: London at %02d:00 server (%02d:00 local)",
+                    InpLondonStartHour, InpLondonStartHour - InpServerUTC_Offset + InpLocalUTC_Offset);
+      else if(dt.hour < InpNYStartHour)
+         whatToDo = StringFormat("Next window: NY at %02d:00 server (%02d:00 local)",
+                    InpNYStartHour, InpNYStartHour - InpServerUTC_Offset + InpLocalUTC_Offset);
+      else
+         whatToDo = "Done for today. Rest, review, prepare for tomorrow.";
+   }
 
    // Open position info
    string posStr = "None";
-   double openPnL = 0;
    for(int i = PositionsTotal() - 1; i >= 0; i--)
    {
       if(!posInfo.SelectByIndex(i)) continue;
       if(posInfo.Magic() != 240325 || posInfo.Symbol() != _Symbol) continue;
-      openPnL = posInfo.Profit() + posInfo.Swap() + posInfo.Commission();
+      double pnl = posInfo.Profit() + posInfo.Swap() + posInfo.Commission();
       double openRiskDist = MathAbs(posInfo.PriceOpen() - posInfo.StopLoss());
       double openPriceDist = (posInfo.PositionType() == POSITION_TYPE_BUY) ?
          (symInfo.Bid() - posInfo.PriceOpen()) : (posInfo.PriceOpen() - symInfo.Ask());
       double openRR = (openRiskDist > 0) ? openPriceDist / openRiskDist : 0;
       posStr = StringFormat("%s %.2f lots | P&L $%.0f | %.1fR",
                 (posInfo.PositionType() == POSITION_TYPE_BUY) ? "LONG" : "SHORT",
-                posInfo.Volume(), openPnL, openRR);
+                posInfo.Volume(), pnl, openRR);
    }
+
+   // SL cap indicator
+   string slCapStr = "";
+   double rawSL = atr * InpSL_ATR_Multiplier;
+   if(rawSL < InpMinSL_Points * _Point) slCapStr = " (floored)";
+   else if(rawSL > InpMaxSL_Points * _Point) slCapStr = " (capped)";
 
    string dash = StringFormat(
       "=====================================================\n"
-      "  FTMO GUARDIAN v3.0 — %s\n"
-      "  %s %04d-%02d-%02d  %02d:%02d:%02d  (server time)\n"
+      "  FTMO GUARDIAN v3.1 — %s\n"
+      "  Server: %s %04d-%02d-%02d  %02d:%02d:%02d\n"
+      "  Local:  %02d:%02d  (UTC%+d)\n"
       "=====================================================\n"
       "\n"
-      "  SHORTCUTS:\n"
       "  Shift+B = BUY    Shift+S = SELL\n"
       "  Shift+X = CLOSE  Shift+E = BREAKEVEN\n"
+      "\n"
+      "  ── WHAT TO DO NOW ──\n"
+      "  H4 Trend:    %s\n"
+      "  Session:     %s\n"
+      "  >> %s\n"
       "\n"
       "  ── ACCOUNT ──\n"
       "  Balance:     $%s\n"
@@ -1005,33 +1084,33 @@ void UpdateDashboard()
       "  Daily P&&L:   $%s  (%s%%)\n"
       "\n"
       "  ── FTMO RULES ──\n"
-      "  Drawdown:    %s%%  (stop at %s%%, FTMO limit %s%%)\n"
-      "  DD Floor:    $%s  (room: $%s)\n"
+      "  Drawdown:    %s%%  (stop %s%%, FTMO %s%%)\n"
+      "  Floor:       $%s  (room: $%s)\n"
       "  Daily cap:   %s%%  (FTMO: %s%%)\n"
       "  Target:      $%s  (need: $%s)\n"
       "  Progress:    %s%%\n"
       "\n"
-      "  ── NEXT TRADE ──\n"
-      "  H4 Trend:    %s\n"
-      "  Session:     %s\n"
-      "  SL distance: %.0f pts (%.1f x ATR)\n"
-      "  TP distance: %.0f pts (1:%.1f)\n"
-      "  Risk:        $%.0f (%.1f%%)\n"
-      "  Spread:      %d pts %s\n"
-      "  Trades left: %d / %d\n"
-      "  Consec loss: %d / %d\n"
+      "  ── NEXT TRADE SIZING ──\n"
+      "  SL: %.0f pts%s  (%.1fx ATR, min %.0f, max %.0f)\n"
+      "  TP: %.0f pts  (1:%.1f)\n"
+      "  Risk: $%.0f  (%.1f%%)\n"
+      "  Spread: %d pts %s\n"
+      "  Trades left: %d    Losses: %d/%d\n"
       "\n"
       "  ── OPEN POSITION ──\n"
       "  %s\n"
       "\n"
-      "  ── KILL SWITCH ──\n"
-      "  %s\n"
+      "  ── KILL SWITCH: %s ──\n"
       "\n"
-      "  ── LAST ACTION ──\n"
+      "  ── LAST ──\n"
       "  %s\n"
       "=====================================================",
       _Symbol,
       days[dt.day_of_week], dt.year, dt.mon, dt.day, dt.hour, dt.min, dt.sec,
+      localHour, dt.min, InpLocalUTC_Offset,
+      trendStr,
+      sessionStr,
+      whatToDo,
       Fmt(balance), Fmt(equity),
       Fmt(dailyPnL), DoubleToString(dailyPct, 2),
       DoubleToString(ddPct, 2), DoubleToString(InpMaxDrawdownPct, 1), DoubleToString(InpFTMO_MaxLossPct, 1),
@@ -1039,14 +1118,11 @@ void UpdateDashboard()
       DoubleToString(InpDailyLossCapPct, 1), DoubleToString(InpFTMO_DailyLossPct, 1),
       Fmt(target), Fmt(needed),
       DoubleToString(progressPct, 1),
-      trendStr,
-      sessionStr,
-      slDist / _Point, InpSL_ATR_Multiplier,
+      slDist / _Point, slCapStr, InpSL_ATR_Multiplier, InpMinSL_Points, InpMaxSL_Points,
       slDist * InpTargetRR / _Point, InpTargetRR,
       riskAmt, InpRiskPercent,
       spread, (spread > InpMaxSpreadPoints) ? "!! HIGH" : "OK",
-      InpMaxTradesPerDay - g_tradesToday, InpMaxTradesPerDay,
-      g_consecLosses, InpMaxConsecLosses,
+      InpMaxTradesPerDay - g_tradesToday, g_consecLosses, InpMaxConsecLosses,
       posStr,
       g_killSwitchActive ? g_killReason : "OFF",
       g_lastAction
